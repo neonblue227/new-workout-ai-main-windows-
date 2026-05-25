@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Project-specific
+models/
+vendor/
+*.mp4
+*.mov
+.pytest_cache/
+.ruff_cache/
+
+# Notebook artefacts
+.ipynb_checkpoints/
+notebooks/data/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+
+# Harness scratch (subagent worktrees, etc.)
+.claude/
