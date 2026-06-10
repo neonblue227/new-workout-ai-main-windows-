@@ -1,3 +1,3 @@
 cd C:\code\new-workout-ai-main\new-workout-ai-main
 uv run python main.py
-uv run python 
+uv run python src/test_2D_3D.py
