@@ -16,6 +16,7 @@ Run:
 
 Keys:
     q / Esc — quit
+    s — save a clean camera frame (no overlays) to data/validation_set/
 
 Why this exists
 ---------------
@@ -31,6 +32,7 @@ that's the seated-OOD effect in action.
 from __future__ import annotations
 
 import argparse
+import datetime
 import sys
 import time
 from pathlib import Path
@@ -68,6 +70,7 @@ from render import SKELETON  # noqa: E402
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 PANEL_PAD = 80  # extra vertical room below each panel for readouts
+SAVE_DIR = PROJECT_ROOT / "data" / "validation_set"
 
 # Diagnostic runs both heavy stages at the camera's native 30 fps. Profiled
 # 2026-05-23 (balanced + CoreML): 2D infer + 3D lift combined = ~22.8 ms median
@@ -684,6 +687,12 @@ def run(argv=None) -> None:
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            elif key == ord("s"):
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                SAVE_DIR.mkdir(parents=True, exist_ok=True)
+                path = str(SAVE_DIR / f"frame_{ts}.png")
+                cv2.imwrite(path, frame_bgr)
+                print(f"[test_2D_3D] Saved screenshot: {path}")
 
             # Cap UI loop at 30 fps (matches a typical webcam's native rate). With
             # inference throttled to 15 Hz separately, the camera panel still updates
