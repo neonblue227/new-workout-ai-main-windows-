@@ -421,6 +421,7 @@ def run(argv=None) -> None:
     last_lift_ts = 0.0
     screenshot_deadline = 0.0
     screenshot_path = ""
+    screenshot_flash_until = 0.0
 
     # Live profiling state. `prof` holds the most recent per-stage ms; `lift_stamps`
     # is a rolling window of lift timestamps used to compute the actual lift fps.
@@ -691,6 +692,7 @@ def run(argv=None) -> None:
                     SAVE_DIR.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(screenshot_path, frame_bgr)
                     print(f"[test_2D_3D] Saved screenshot: {screenshot_path}")
+                    screenshot_flash_until = time.time() + 0.3
                     screenshot_deadline = 0
                     screenshot_path = ""
                 else:
@@ -703,6 +705,10 @@ def run(argv=None) -> None:
                         scale=1.3,
                         thick=3,
                     )
+
+            if time.time() < screenshot_flash_until:
+                overlay = np.full_like(canvas, 255)
+                cv2.addWeighted(overlay, 0.4, canvas, 0.6, 0, dst=canvas)
 
             cv2.imshow(window_name, canvas)
 
