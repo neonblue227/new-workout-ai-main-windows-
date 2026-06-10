@@ -1,6 +1,6 @@
 # Workout AI — Real-Time Form Coach (Thai)
 
-Real-time webcam-based form coach for macOS Apple Silicon. The current entry point is a guided neck-stretch routine: four alternating 25-second holds (left, right, left, right) with live Thai coaching and spoken cues. Joint angles are measured **directly from 2D keypoints** (nose / ears / shoulders) — robust to the seated, desk-camera framing where the 3D lift fails (see `CLAUDE.md` → "2D-direct measurement"); the 3D rig on screen is visualization-only. **Squat coaching code** is preserved in the codebase but is not currently wired to the launcher; see `CLAUDE.md` for how to re-enable it.
+Real-time webcam-based form coach (Windows + macOS). The current entry point is a guided neck-stretch routine: four alternating 25-second holds (left, right, left, right) with live Thai coaching and spoken cues. Joint angles are measured **directly from 2D keypoints** (nose / ears / shoulders) — robust to the seated, desk-camera framing where the 3D lift fails (see `CLAUDE.md` → "2D-direct measurement"); the 3D rig on screen is visualization-only. **Squat coaching code** is preserved in the codebase but is not currently wired to the launcher; see `CLAUDE.md` for how to re-enable it.
 
 ## Setup
 
@@ -59,18 +59,18 @@ uv run ruff format                  # format
 
 | Layer | Model | Framework |
 |---|---|---|
-| 2D pose | YOLOX-m + RTMPose-m (balanced; default) | rtmlib (ONNX) on **CoreML / Neural Engine** |
-| 3D lift (visualization only) | MotionBERT-Lite | PyTorch on MPS |
+| 2D pose | YOLOX-m + RTMPose-m (balanced; default) | rtmlib — **PyTorch + onnx2torch on CUDA** (primary); ORT CoreML on macOS |
+| 3D lift (visualization only) | MotionBERT-Lite | PyTorch on CUDA (Windows) / MPS (macOS) |
 | Form analysis | **2D-direct** joint angles + per-user calibration + camera-view gating + phase FSM | pure Python |
-| Thai feedback | Qwen3.5-4B (mxfp4) | mlx-vlm |
+| Thai feedback | Qwen3-4B (INT4 NF4) | HuggingFace Transformers + bitsandbytes on CUDA |
 
-The 2D model defaults to the balanced tier on the Neural Engine (54 fps; far more accurate keypoints than the old lightweight+CPU path). CPU stays cool — ONNX threads are pinned to 2 and inference is throttled to ~15 Hz. See `docs/perf/2026-05-23-coreml-experiment.md`.
+The 2D model defaults to the balanced tier on CUDA (NVIDIA GPU). On macOS it falls back to CoreML/ANE (54 fps). CPU stays cool — ONNX threads pinned to 2, inference throttled to ~15 Hz. See `docs/perf/2026-05-23-coreml-experiment.md`.
 
 ## Acceptance criteria
 
 Shared pipeline (both modes):
 
-- [x] Skeleton overlay ≥ 25 FPS on M-series (balanced + CoreML ≈ 54 fps; full per-frame infer+lift ≈ 23 ms).
+- [x] Skeleton overlay ≥ 25 FPS (balanced + CUDA ≈ 30+ fps; full per-frame infer+lift ≈ 23 ms).
 - [x] 3D rig updates at ≥ 5 Hz (6 Hz in `app`, up to 30 Hz in the diagnostic).
 - [x] Models live in `./models/` and load from disk on subsequent runs.
 

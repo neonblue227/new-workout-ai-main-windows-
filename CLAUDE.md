@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Real-time webcam-based form coach for macOS Apple Silicon. Streams from the webcam, runs 2D pose → **2D-direct angle measurement** → rule-based form analysis, and produces Thai-language coaching feedback from an on-device VLM. A 3D lift (MotionBERT-Lite) still runs for the on-screen rig, but is **visualization-only** — see "2D-direct measurement" below for why the measurements no longer come from the 3D pose.
+Real-time webcam-based form coach (Windows + macOS). Streams from the webcam, runs 2D pose → **2D-direct angle measurement** → rule-based form analysis, and produces Thai-language coaching feedback from an on-device LLM. A 3D lift (MotionBERT-Lite) still runs for the on-screen rig, but is **visualization-only** — see "2D-direct measurement" below for why the measurements no longer come from the 3D pose.
 
 **Two exercise modes coexist in the codebase:**
 
@@ -57,7 +57,7 @@ Data flow per frame (hold mode — used within each set of the routine):
 ```
 ── session start: _calibration_phase (5 s) → BaselinePose (user's own neutral pose)
 WebcamCapture (bg thread)
-   → Pose2D (YOLOX-m + RTMPose-m via rtmlib/ONNX on CoreML/ANE)  kps:(17,2) + scores
+   → Pose2D (YOLOX-m + RTMPose-m via rtmlib — PyTorch+onnx2torch on CUDA, ORT CoreML on macOS)  kps:(17,2) + scores
        (2D inference gated on a NEW camera frame via cap.read_latest_with_ts —
         the loop runs faster than the camera, so duplicate frames reuse the last
         kps/scores instead of re-inferring; the UI loop is capped at ~30 fps)
@@ -68,7 +68,7 @@ WebcamCapture (bg thread)
        → rules_hold.score_frame(target, measured)          (in_target: bool, violations)
            → HoldFSM.update(in_target, ts)                 IDLE → ENTERING → HOLDING → COMPLETE (with DRIFTED branch)
    → (visualization only) coco17_to_h36m17 → Pose3DBuffer (27-frame) → Pose3D
-                                   (MotionBERT-Lite, MPS) → rig for the on-screen panel
+                                   (MotionBERT-Lite, CUDA on Windows / MPS on macOS) → rig for the on-screen panel
    → live (throttled ≥ 2.5s): LLMWorker.submit(LiveSnapshot, exercise=...)
    → on COMPLETE: rules_hold.score_hold(...) → LLMWorker.submit(HoldAnalysis, exercise=...)
                   → ThaiCoachLLM.generate(payload, exercise=...) — dispatches on payload type
@@ -117,22 +117,22 @@ Per-exercise data lives under `src/exercises/`. Each module declares `name`, `di
 
 ### LLM feedback
 
-`feedback/llm.py::ThaiCoachLLM` wraps Qwen3.5-4B (mxfp4) via `mlx-vlm`. First `generate()` call is slow (compilation) — `app.run()` calls `warmup()` before entering the loop; preserve that order. `generate(payload, ..., exercise=None)` dispatches on payload type:
+`feedback/llm.py::ThaiCoachLLM` wraps **Qwen3-4B via HuggingFace Transformers + bitsandbytes INT4 on CUDA** (CPU float32 fallback). First `generate()` call is slow (CUDA kernel compilation) — `app.run()` calls `warmup()` before entering the loop; preserve that order. `generate(payload, ..., exercise=None)` dispatches on payload type:
 - `RepAnalysis` → squat system prompt + `build_user_prompt` (no `exercise` needed).
 - `HoldAnalysis` → hold system prompt + `build_hold_summary_prompt(payload, exercise)` — `exercise=` is **required**, else `ValueError`.
 - `LiveSnapshot` → hold system prompt + `build_live_prompt(payload, exercise)` — `exercise=` is **required**, else `ValueError`.
 
 `feedback/worker.py::LLMWorker` runs in a background thread with **drop-stale** semantics: `submit(payload, **kwargs)` replaces any pending submission that hasn't been processed yet. There is no queue. Kwargs (including `exercise=`) are stored alongside the payload and forwarded to `generate()`. If submissions arrive faster than the LLM, older ones are silently dropped — by design, since stale feedback is worse than no feedback.
 
-Hold-mode live cadence: `app.run_session` throttles submissions to ≥ 2.5 s apart (Qwen 4B mxfp4 on MPS produces a short Thai phrase in ~1–2 s, so faster submission is wasted work). Expect roughly one fresh nudge every 3–4 s during a 20 s hold.
+Hold-mode live cadence: `app.run_session` throttles submissions to ≥ 2.5 s apart (Qwen3-4B INT4 on CUDA produces a short Thai phrase in ~1–3 s on an RTX 3050, so faster submission is wasted work). Expect roughly one fresh nudge every 3–4 s during a 20 s hold.
 
 ### Model artifacts
 
 All models live under `./models/` (gitignored) and are downloaded by `scripts/download_models.py`:
 
-- `models/rtmlib_cache/` — YOLOX + RTMPose ONNX, all three rtmlib tiers cached (tiny/m/x detectors, s/m/x pose). `Pose2D` defaults to **`mode="balanced"` (YOLOX-m + RTMPose-m) + `accelerator="coreml"`** (Apple Neural Engine). Benchmarks (`docs/perf/2026-05-23-coreml-experiment.md`): balanced is 8.7 fps on CPU but 54 fps on CoreML, with noticeably better keypoint accuracy than lightweight — the upgrade is what makes the 2D-direct CVA / forward-head metrics reliable. CoreML uses `RequireStaticInputShapes=1` + `ModelFormat=MLProgram` so the dynamic-shape YOLOX NMS subgraph falls back to CPU (dodges the zero-detection crash). It also sets `ModelCacheDirectory=models/coreml_cache` (gitignored) + `SpecializationStrategy=FastPrediction` so the compiled `.mlmodelc` persists across launches instead of recompiling both models every start (Pose2D construction ~0.5 s cold → ~0.1 s warm). ORT never invalidates this cache — clear `models/coreml_cache/` if you swap a model file or change EP options. `Pose2D` also pins `intra_op_num_threads=2` (faster *and* ~80% less CPU than ORT's all-cores default on M-series).
+- `models/rtmlib_cache/` — YOLOX + RTMPose ONNX, all three rtmlib tiers cached (tiny/m/x detectors, s/m/x pose). `Pose2D` defaults to **`mode="balanced"` (YOLOX-m + RTMPose-m) + `accelerator="cuda"`** on Windows (NVIDIA GPU via PyTorch + onnx2torch), falling back to CoreML on macOS. On CUDA each model is converted at load time via `onnx2torch` and run as a PyTorch `nn.Module`; an ORT CPU session is kept as a runtime fallback. CoreML uses `RequireStaticInputShapes=1` + `ModelFormat=MLProgram` so the dynamic-shape YOLOX NMS subgraph falls back to CPU (dodges the zero-detection crash). Clear `models/coreml_cache/` if you swap a model file or change macOS EP options.
 - `models/motionbert/checkpoint/pose3d/FT_MB_lite_MB_ft_h36m_global_lite/best_epoch.bin` — MotionBERT-Lite weights (HF: `walterzhu/MotionBERT`). Visualization-only (see "2D-direct measurement").
-- `models/qwen3_5_4b_mxfp4/` — Qwen3.5-4B mxfp4 mlx-vlm snapshot
+- `models/qwen3_4b/` — Qwen3-4B HuggingFace snapshot (downloaded via `snapshot_download` from `Qwen/Qwen3-4B`; ~8 GB). Used by `ThaiCoachLLM` with bitsandbytes INT4 NF4 quantisation on CUDA.
 
 `vendor/motionbert/` is a checked-out copy of the upstream MotionBERT repo (gitignored as `vendor/`). `pose3d.py` does `sys.path.insert(0, MOTIONBERT_DIR)` and imports `lib.model.DSTformer` + `lib.utils.tools.get_config` from it. The config file at `vendor/motionbert/configs/pose3d/MB_ft_h36m_global_lite.yaml` is required at construction time. If `vendor/` is missing or wiped, `Pose3D` cannot be constructed — re-clone MotionBERT into `vendor/motionbert/`.
 
@@ -173,12 +173,12 @@ Notebook conventions:
 - Keep exploratory notebooks under `notebooks/` (gitignored if they balloon with model outputs); promote stable cells into `tests/` as pure-logic tests once the behavior is settled.
 - For attention/heatmap visualizations use `matplotlib.imshow` with `cmap="jet"` and alpha-blend over the frame — mirrors `Renderer._overlay_attention` so visuals stay consistent with the live app.
 - For the 3D rig, draw bones with `SKELETON` from `render.py` so the topology matches what the user sees in the panel.
-- Heavy models survive across cells — don't re-instantiate `Pose2D` / `Pose3D` / `ThaiCoachLLM` unless you actually need to; reuse the existing object to keep MPS memory pressure down.
+- Heavy models survive across cells — don't re-instantiate `Pose2D` / `Pose3D` / `ThaiCoachLLM` unless you actually need to; reuse the existing object to keep GPU memory pressure down.
 
 ### Tools available beyond the standard set
 
 - **Python LSP** — use it to jump to definitions, find references, and rename symbols when navigating the codebase. Preferred over `grep` for symbol-level questions ("where is `coco17_to_h36m17` called from?", "what implements `on_rep_complete`?").
-- **context7 MCP plugin** — fetch current docs for `mlx-vlm`, `rtmlib`, `torch` (MPS specifics), `mediapipe`/`opencv-python`, `huggingface_hub`, FastAPI/Starlette, WebRTC libs, etc. Use whenever an API surface might have drifted from training data, especially before writing integration code against `mlx-vlm` or MotionBERT internals.
+- **context7 MCP plugin** — fetch current docs for `onnx2torch`, `rtmlib`, `torch` (CUDA/cuDNN specifics), `transformers`, `bitsandbytes`, `mediapipe`/`opencv-python`, `huggingface_hub`, FastAPI/Starlette, WebRTC libs, etc. Use whenever an API surface might have drifted from training data, especially before writing integration code against MotionBERT or onnx2torch internals.
 
 ## Long-term direction: streaming server for mobile client
 

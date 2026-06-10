@@ -14,6 +14,12 @@ import time
 
 import cv2
 import numpy as np
+import onnxruntime as ort
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 import screens
 from analysis.angles import (
@@ -133,6 +139,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
 def run(argv=None):
     args = _parse_args(argv)
     cap = build_capture(args.source, args.url, width=1280, height=720)
+
+    print("[startup] onnxruntime providers=", ort.get_available_providers())
+    if torch is not None:
+        print("[startup] torch cuda available=", torch.cuda.is_available(), "cuda version=", getattr(torch.version, "cuda", None))
+    else:
+        print("[startup] torch not installed in runtime environment")
     pose = Pose2D()
 
     print("Loading 3D lifter (MotionBERT) for the debug rig...")

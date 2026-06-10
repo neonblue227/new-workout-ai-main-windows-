@@ -14,30 +14,67 @@ from feedback.prompt_th import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "qwen3_5_4b_mxfp4"
+DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / "qwen3_4b"
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", flags=re.DOTALL)
 
 
 class ThaiCoachLLM:
-    """Wraps Qwen3.5-4B (vision-language) via mlx-vlm, with a Thai fallback."""
+    """Wraps Qwen3-4B via HuggingFace Transformers + bitsandbytes INT4 on CUDA.
+
+    Falls back to static Thai templates when the model directory is absent or
+    transformers/bitsandbytes are unavailable (e.g. CPU-only CI environment).
+    """
 
     def __init__(self, model_dir: Path | str | None = None):
         self._backend = "fallback"
         self._model = None
-        self._processor = None
-        self._config = None
+        self._tokenizer = None
 
         model_path = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
         try:
-            from mlx_vlm import load
-            from mlx_vlm.utils import load_config
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            self._model, self._processor = load(str(model_path))
-            self._config = load_config(str(model_path))
-            self._backend = "mlx_vlm"
-        except Exception as exc:  # pragma: no cover - environment-dependent
-            print(f"[llm] mlx_vlm unavailable ({exc}); using fallback Thai feedback")
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"[llm] Model directory not found: {model_path}. "
+                    "Run: uv run python scripts/download_models.py"
+                )
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                str(model_path), trust_remote_code=True
+            )
+
+            # Prefer CUDA; fall back to CPU (float32) so code still runs on
+            # machines without a GPU (e.g. CI runners).
+            if torch.cuda.is_available():
+                from transformers import BitsAndBytesConfig
+
+                quant_cfg = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    str(model_path),
+                    quantization_config=quant_cfg,
+                    device_map="cuda",
+                    trust_remote_code=True,
+                )
+                self._backend = "transformers_cuda"
+            else:
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    str(model_path),
+                    torch_dtype=torch.float32,
+                    device_map="cpu",
+                    trust_remote_code=True,
+                )
+                self._backend = "transformers_cpu"
+
+        except Exception as exc:
+            print(f"[llm] transformers unavailable ({exc}); using fallback Thai feedback")
 
     def generate(
         self,
@@ -46,9 +83,8 @@ class ThaiCoachLLM:
         frame_bgr: Optional[np.ndarray] = None,
         exercise=None,  # required for HoldAnalysis / LiveSnapshot
     ) -> str:
-        if self._backend == "mlx_vlm":
-            from mlx_vlm import generate as mlx_generate
-            from mlx_vlm.prompt_utils import apply_chat_template
+        if self._backend.startswith("transformers"):
+            import torch
 
             if isinstance(payload, RepAnalysis):
                 system = SYSTEM_TH
@@ -70,23 +106,33 @@ class ThaiCoachLLM:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ]
-            prompt = apply_chat_template(
-                self._processor,
-                self._config,
+
+            # apply_chat_template handles system/user formatting for Qwen3
+            text_input = self._tokenizer.apply_chat_template(
                 messages,
-                num_images=0,
-                enable_thinking=False,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,  # suppress <think> blocks at the model level
             )
-            result = mlx_generate(
-                self._model,
-                self._processor,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                verbose=False,
-            )
-            text = getattr(result, "text", str(result))
+            inputs = self._tokenizer(text_input, return_tensors="pt")
+
+            device = next(self._model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                out = self._model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=False,
+                    pad_token_id=self._tokenizer.eos_token_id,
+                )
+
+            # Decode only the newly generated tokens (skip the prompt)
+            new_tokens = out[0][inputs["input_ids"].shape[1]:]
+            text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
             return _THINK_BLOCK.sub("", text).strip()
 
+        # ── fallback (static templates) ────────────────────────────────────
         if isinstance(payload, RepAnalysis):
             return self._fallback_rep(payload)
         if isinstance(payload, HoldAnalysis):
@@ -100,7 +146,7 @@ class ThaiCoachLLM:
         raise TypeError(f"Unsupported payload type: {type(payload).__name__}")
 
     def warmup(self):
-        """First call is slow due to compilation. Run once at app start."""
+        """First call compiles CUDA kernels. Run once at app start."""
         if self._backend == "fallback":
             return
 
@@ -119,6 +165,8 @@ class ThaiCoachLLM:
             ascent_ms=0,
         )
         _ = self.generate(dummy, max_tokens=16)
+
+    # ── static fallback templates ──────────────────────────────────────────
 
     def _fallback_rep(self, payload: RepAnalysis) -> str:
         detail = payload.violations[0].detail_th if payload.violations else ""

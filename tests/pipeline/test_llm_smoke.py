@@ -2,17 +2,17 @@ import builtins
 from pathlib import Path
 import pytest
 
-QWEN_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "qwen3_5_4b_mxfp4"
+QWEN_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "qwen3_4b"
 
 
-def test_llm_falls_back_when_mlx_vlm_is_unavailable(monkeypatch):
+def test_llm_falls_back_when_transformers_is_unavailable(monkeypatch):
     from analysis.types import HoldAnalysis, HoldState, LiveSnapshot, RepAnalysis
 
     real_import = builtins.__import__
 
     def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "mlx_vlm" or name.startswith("mlx_vlm."):
-            raise ModuleNotFoundError("no module named 'mlx_vlm'")
+        if name == "transformers" or name.startswith("transformers."):
+            raise ModuleNotFoundError("no module named 'transformers'")
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)

@@ -1,8 +1,18 @@
 from pathlib import Path
 from typing import Literal, Optional
+import os
+import sys
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Put torch's CUDA runtime DLLs on PATH so onnxruntime-gpu can find cublas/cudnn.
+# PyTorch ships cublasLt64_12.dll, cudnn64_9.dll, etc. in torch/lib/.
+# onnxruntime-gpu finds them via PATH but they aren't there by default on Windows.
+_TORCH_LIB = PROJECT_ROOT / ".venv" / "Lib" / "site-packages" / "torch" / "lib"
+if _TORCH_LIB.exists():
+    os.environ.setdefault("PATH", "")
+    os.environ["PATH"] = str(_TORCH_LIB) + os.pathsep + os.environ["PATH"]
 
 # rtmlib hardcodes its cache to ~/.cache/rtmlib via TORCH_HOME/XDG_CACHE_HOME and
 # ignores any RTMLIB_CACHE env var. Redirect it to the in-repo models/ folder by
@@ -13,33 +23,17 @@ _RTMLIB_HUB = PROJECT_ROOT / "models" / "rtmlib_cache" / "hub"
 _rtmlib_file._get_rtmhub_dir = lambda: str(_RTMLIB_HUB)
 
 
-# Default ONNX intra-op thread count for both detection and pose sessions.
-# ORT's default is `num_logical_cpus`, which thrashes on an M-series and is
-# objectively slower than 2-4 threads for our tiny models. Sweep on 2026-05-23
-# (M-series, 18 logical cores, onnxruntime 1.26.0) — see
-# docs/perf/2026-05-23-baseline.md:
-#   threads=default (18) → 53 fps, 1247% process CPU
-#   threads=2            → 59 fps, 239% process CPU  (+11% throughput, -81% CPU)
-#   threads=4            → 61 fps, 527% process CPU
-# Two threads is the sweet spot for our real-time target.
+# Default ONNX intra-op thread count — only used in the CPU fallback path when
+# onnx2torch is unavailable. ORT's default is `num_logical_cpus`, which is
+# objectively slower than 2-4 threads for our tiny models.  Sweep on 2026-05-23
+# (M-series, 18 logical cores): threads=2 → 59 fps, 239% CPU (+11% vs default).
 _ONNX_THREADS_DEFAULT = 2
 
-# CoreML EP provider config that (a) routes the conv backbone onto the Apple
-# Neural Engine / GPU and (b) keeps the dynamic-shape YOLOX NMS subgraph on CPU
-# via `RequireStaticInputShapes=1`, which sidesteps the zero-detection crash
-# (CoreML EP can't handle a {-1} tensor that becomes {0} at runtime). MLProgram
-# is the modern CoreML format with proper dynamic-shape handling. Benchmark on
-# 2026-05-23 (onnxruntime 1.26.0) shows ANE scales hard with model size:
-# RTMPose-s 1.5x / RTMPose-m 2.7x / RTMPose-x 8.6x faster than CPU+threads=2.
-# See docs/perf/2026-05-23-coreml-experiment.md.
-#
-# `ModelCacheDirectory` persists the compiled .mlmodelc so CoreML doesn't
-# recompile both models on every process start (the dominant chunk of first-
-# inference latency / startup CPU). ORT keys the cache on the model file-path
-# hash, so the detector and pose sessions don't collide. NOTE: ORT never
-# invalidates this cache — if you swap a model file or change EP options, clear
-# the directory. `SpecializationStrategy=FastPrediction` optimizes the compiled
-# model for prediction latency over load time (paid once, then cached).
+# CoreML EP provider config (macOS only — Apple Neural Engine).
+# `RequireStaticInputShapes=1` keeps the dynamic-shape YOLOX NMS subgraph on CPU
+# to dodge the zero-detection crash. Cache persists compiled .mlmodelc across
+# launches (`ModelCacheDirectory`). Clear `models/coreml_cache/` if you swap
+# a model file or change EP options.
 _COREML_CACHE_DIR = PROJECT_ROOT / "models" / "coreml_cache"
 _COREML_PROVIDER = (
     "CoreMLExecutionProvider",
@@ -52,100 +46,241 @@ _COREML_PROVIDER = (
     },
 )
 
-Accelerator = Literal["cpu", "coreml"]
+# CUDA EP provider config (Windows/Linux NVIDIA GPU) — used as fallback when
+# onnx2torch is unavailable or model conversion fails.
+_CUDA_PROVIDER = (
+    "CUDAExecutionProvider",
+    {"device_id": 0},
+)
+
+# DirectML provider name (Windows DirectML, no NVIDIA required)
+_DML_PROVIDER = "DmlExecutionProvider"
+
+Accelerator = Literal["cpu", "coreml", "cuda", "dml"]
 
 
-def _rebuild_session(sub_model, providers: list, intra_op_threads: int) -> None:
-    """Replace `sub_model.session` with an equivalent InferenceSession using the
-    given execution-provider list + a constrained CPU thread pool. Works against
-    rtmlib's YOLOX / RTMPose wrappers where `sub_model.session` and
-    `sub_model.onnx_model` are public attributes."""
+def _get_default_accelerator() -> Accelerator:
+    """Auto-detect platform and return the appropriate accelerator.
+
+    - macOS: CoreML (Apple Neural Engine) for best performance
+    - Windows/Linux: CUDA (NVIDIA GPU) if available, else CPU
+    """
+    if sys.platform == "darwin":
+        return "coreml"
+    # Windows and Linux: prefer CUDA via PyTorch
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    # ORT DirectML fallback (Windows only, no NVIDIA required)
+    if sys.platform == "win32":
+        try:
+            import onnxruntime as ort
+            if "DmlExecutionProvider" in ort.get_available_providers():
+                return "dml"
+        except Exception:
+            pass
+    return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Session builder: dispatch to the fastest backend per-platform
+# ---------------------------------------------------------------------------
+
+def _try_ort_session(onnx_path: str, providers: list) -> "onnxruntime.InferenceSession":
+    """Create an ORT session, falling back to CPU if the requested EP fails."""
     import onnxruntime as ort
 
     opts = ort.SessionOptions()
-    opts.intra_op_num_threads = intra_op_threads
+    opts.intra_op_num_threads = _ONNX_THREADS_DEFAULT
     opts.inter_op_num_threads = 1
-    opts.log_severity_level = 3  # silence CoreML compile chatter
-    sub_model.session = ort.InferenceSession(
-        sub_model.onnx_model,
-        sess_options=opts,
-        providers=providers,
-    )
+    opts.log_severity_level = 3
+    try:
+        return ort.InferenceSession(onnx_path, sess_options=opts, providers=providers)
+    except Exception:
+        return ort.InferenceSession(
+            onnx_path, sess_options=opts, providers=["CPUExecutionProvider"]
+        )
 
+
+def _try_onnx2torch_session(onnx_path: str):
+    """Convert ONNX → PyTorch nn.Module via onnx2torch.
+
+    Returns (pt_model, input_names) or (None, None) if conversion fails.
+    Only used for the CPU path since ORT CUDA is faster than PyTorch eager.
+    """
+    try:
+        import onnx2torch
+        import onnx
+        import torch
+
+        onnx_model = onnx.load(onnx_path)
+        pt_model = onnx2torch.convert(onnx_model)
+        pt_model.eval().to("cpu")
+        input_names = [i.name for i in onnx_model.graph.input]
+        return pt_model, input_names
+    except Exception as exc:
+        if onnx_path:
+            print(f"[pose2d] onnx2torch skipped for {Path(onnx_path).name}: {exc}")
+        return None, None
+
+
+def _build_session(sub_model, device: str) -> None:
+    """Replace `sub_model.session` with the best available backend.
+
+    Dispatch:
+      - cuda  → ORT CUDAExecutionProvider  (fastest ONNX path on NVIDIA)
+      - cpu   → onnx2torch PyTorch, or ORT CPU if conversion fails
+      - coreml → ORT CoreMLExecutionProvider
+      - dml    → ORT DmlExecutionProvider
+    """
+    onnx_path = sub_model.onnx_model
+
+    # ── CUDA: ORT CUDAExecutionProvider (fastest path for ONNX on NVIDIA) ──
+    if device == "cuda":
+        session = _try_ort_session(onnx_path, [_CUDA_PROVIDER, "CPUExecutionProvider"])
+        backend = "ort+cuda"
+        print(f"[pose2d] {Path(onnx_path).name}: backend={backend}")
+        sub_model.session = session
+        return
+
+    # ── CPU: onnx2torch PyTorch (primary), ORT CPU fallback ───────────────
+    if device == "cpu":
+        pt_model, input_names = _try_onnx2torch_session(onnx_path)
+        if pt_model is not None:
+            from functools import partial as _partial
+            import torch
+            import numpy as np
+
+            def _run_pt(feed, model=pt_model, names=input_names):
+                tensors = [torch.from_numpy(feed[n]).cpu() for n in names]
+                with torch.no_grad():
+                    out = model(*tensors)
+                if isinstance(out, torch.Tensor):
+                    out = [out]
+                elif isinstance(out, (list, tuple)):
+                    pass
+                else:
+                    out = list(out)
+                return [o.cpu().numpy() if isinstance(o, torch.Tensor) else o for o in out]
+
+            session = _PytorchSession(pt_model, input_names, _run_pt)
+            backend = "pytorch+cpu"
+        else:
+            session = _try_ort_session(onnx_path, ["CPUExecutionProvider"])
+            backend = "ort+cpu"
+        print(f"[pose2d] {Path(onnx_path).name}: backend={backend}")
+        sub_model.session = session
+        return
+
+    # ── macOS CoreML / Windows DML ────────────────────────────────────────
+    if device == "coreml":
+        _COREML_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        providers = [_COREML_PROVIDER, "CPUExecutionProvider"]
+    elif device == "dml":
+        providers = [_DML_PROVIDER, "CPUExecutionProvider"]
+    else:
+        providers = ["CPUExecutionProvider"]
+
+    session = _try_ort_session(onnx_path, providers)
+    backend = device if device in ("coreml", "dml") else "cpu"
+    print(f"[pose2d] {Path(onnx_path).name}: backend=ort+{backend}")
+    sub_model.session = session
+
+
+class _PytorchSession:
+    """Thin wrapper that makes onnx2torch models look like an ORT InferenceSession.
+
+    rtmlib expects `session.run(None, {input_name: array}) → list[np.ndarray]`.
+    """
+
+    def __init__(self, pt_model, input_names, run_fn):
+        self._run_fn = run_fn
+        self._pt_model = pt_model
+        self._input_names = input_names
+
+    def run(self, output_names, input_feed: dict):
+        return self._run_fn(input_feed)
+
+    def get_inputs(self):
+        class _I:
+            def __init__(self, name):
+                self.name = name
+        return [_I(n) for n in self._input_names]
+
+    def get_outputs(self):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Public Pose2D class
+# ---------------------------------------------------------------------------
 
 class Pose2D:
-    """Wraps rtmlib's RTMPose. Single-person inference: returns the highest-score person.
-    Optionally returns simcc-decoded heatmaps via `infer_with_heatmaps`.
+    """Wraps rtmlib's RTMPose.  Single-person inference: returns the highest-
+    score person.  Optionally returns simcc-decoded heatmaps via
+    `infer_with_heatmaps`.
 
-    Model sizes (full-pipeline median ms on M-series, onnxruntime 1.26.0 —
-    see docs/perf/2026-05-23-coreml-experiment.md):
+    Model sizes (full-pipeline median ms on M-series — CoreML):
       - `mode="lightweight"` (YOLOX-tiny + RTMPose-s): 14.7 ms CPU / 11.8 ms CoreML
       - `mode="balanced"` (YOLOX-m + RTMPose-m): 114 ms CPU / 18.6 ms CoreML  ← DEFAULT
       - `mode="performance"` (YOLOX-x + RTMPose-x): 416 ms CPU / 89 ms CoreML
 
-    Default is `mode="balanced"` + `accelerator="coreml"`: at 54 fps it's well above
-    the live 15 Hz inference target with far better keypoint accuracy than lightweight,
-    and the conv compute runs on the Neural Engine instead of the CPU. balanced is
-    unusable on CPU (8.7 fps), so the default only makes sense paired with CoreML.
+    Accelerator selection:
+      - macOS: CoreML (Apple Neural Engine) — ORT session path
+      - Windows/Linux with NVIDIA: CUDA via **PyTorch + onnx2torch** (primary),
+        ORT CUDAExecutionProvider (fallback if onnx2torch conversion fails)
+      - Windows without NVIDIA: DirectML via ORT session path
+      - Everything else: CPU via PyTorch + onnx2torch (primary), ORT (fallback)
 
-    `accelerator` selects the execution provider for both sessions:
-      - `"cpu"` (default): CPUExecutionProvider with `onnx_threads` intra-op threads.
-        Best for the lightweight model — the conv backbone is small enough that
-        CoreML's per-inference overhead isn't worth it.
-      - `"coreml"`: routes the conv backbone onto the Apple Neural Engine / GPU
-        while keeping the dynamic-shape YOLOX NMS subgraph on CPU
-        (`RequireStaticInputShapes=1`) to dodge the zero-detection crash. Wins
-        grow with model size — pick this when running `balanced` / `performance`.
-        See `_COREML_PROVIDER` and `docs/perf/2026-05-23-coreml-experiment.md`.
-
-    `onnx_threads` constrains the ONNX intra-op thread pool of both sessions.
-    Defaults to `_ONNX_THREADS_DEFAULT = 2`, which is faster AND uses ~80% less
-    CPU than ORT's default of "all cores" on M-series for our tiny models. With
-    `accelerator="coreml"` this still bounds the CPU-side ops (NMS, fallbacks).
-
-    `device` is retained for signature compatibility but is no longer used for
-    EP selection — sessions are always rebuilt below per `accelerator`.
+    `onnx_threads` applies only to the ORT fallback path.
     """
 
     def __init__(
         self,
         device: str = "cpu",
-        mode: Literal["lightweight", "balanced", "performance"] = "balanced",
+        mode: Literal["lightweight", "balanced", "performance"] | None = None,
         onnx_threads: int = _ONNX_THREADS_DEFAULT,
-        accelerator: Accelerator = "coreml",
+        accelerator: Accelerator | None = None,
     ):
         from rtmlib import Body
 
-        # Always construct on CPU; sessions are rebuilt below per `accelerator`.
-        # (Constructing rtmlib's Body with device="mps" can crash YOLOX during
-        # inference; routing CoreML via session rebuild gives us full control of
-        # the provider options needed to avoid that.)
+        # Auto-detect accelerator and pick a mode that runs well on it.
+        if accelerator is None:
+            accelerator = _get_default_accelerator()
+
+        # CUDA on laptop GPUs (RTX 3050) can't sustain balanced at 25+ FPS.
+        # Default to lightweight mode which runs at 36 FPS on CUDA.
+        if mode is None:
+            mode = "lightweight" if accelerator == "cuda" else "balanced"
+
+        # Always construct rtmlib on CPU; we replace the sessions below.
         self._body = Body(
             mode=mode, to_openpose=False, backend="onnxruntime", device="cpu"
         )
 
-        if accelerator == "coreml":
-            _COREML_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            providers: list = [_COREML_PROVIDER, "CPUExecutionProvider"]
-        else:
-            providers = ["CPUExecutionProvider"]
+        # Map accelerator → torch device string (used by _PytorchSession)
+        _torch_device = {"cuda": "cuda", "cpu": "cpu"}.get(accelerator, accelerator)
 
-        threads = onnx_threads if onnx_threads > 0 else _ONNX_THREADS_DEFAULT
-        _rebuild_session(self._body.det_model, providers, threads)
-        _rebuild_session(self._body.pose_model, providers, threads)
+        print(f"[pose2d] accelerator={accelerator}")
+        _build_session(self._body.det_model, accelerator)
+        _build_session(self._body.pose_model, accelerator)
 
         # rtmlib 0.0.15 exposes the pose estimator as `pose_model`
         self._pose = getattr(self._body, "pose_model", None)
 
         if self._pose is not None:
-            # Monkey-patch inference to capture raw simcc outputs for attention overlay.
+            # Monkey-patch inference to capture raw simcc outputs for the
+            # attention overlay (works with both the PyTorch shim and ORT).
             pose_model = self._pose
             _orig_inference = pose_model.inference
 
             def _capturing_inference(image):
                 result = _orig_inference(image)
                 try:
-                    # inference returns [simcc_x, simcc_y] — each shape (1, N_kpts, simcc_bins)
+                    # inference returns [simcc_x, simcc_y] — each (1, N_kpts, bins)
                     if isinstance(result, (list, tuple)) and len(result) == 2:
                         pose_model._last_simcc = result
                 except Exception:

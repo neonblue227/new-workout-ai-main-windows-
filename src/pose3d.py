@@ -72,11 +72,26 @@ def _normalize_2d(kps: np.ndarray, frame_h: int, frame_w: int) -> np.ndarray:
 
 
 class Pose3D:
-    """MotionBERT-Lite wrapper for 2D->3D lifting on a sliding 27-frame window."""
+    """MotionBERT-Lite wrapper for 2D->3D lifting on a sliding 27-frame window.
+    
+    Device selection (in order of preference):
+      - macOS: MPS (Metal Performance Shaders) if available, else CPU
+      - Windows: CUDA if available, else CPU
+      - Linux: CPU
+    """
 
     def __init__(self, window_size: int = 27, device: str | None = None):
         if device is None:
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            # Auto-detect optimal device based on platform
+            if sys.platform == "darwin":
+                # macOS: prefer MPS (Metal Performance Shaders for M-series)
+                device = "mps" if torch.backends.mps.is_available() else "cpu"
+            elif sys.platform == "win32":
+                # Windows: prefer CUDA (NVIDIA GPU)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                # Linux and others: use CPU (can be extended to support other GPUs)
+                device = "cpu"
         self.device = torch.device(device)
 
         sys.path.insert(0, str(MOTIONBERT_DIR))
