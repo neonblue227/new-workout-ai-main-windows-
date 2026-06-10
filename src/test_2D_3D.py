@@ -419,6 +419,8 @@ def run(argv=None) -> None:
     last_scores: Optional[np.ndarray] = None
     last_processed_ts = -1.0
     last_lift_ts = 0.0
+    screenshot_deadline = 0.0
+    screenshot_path = ""
 
     # Live profiling state. `prof` holds the most recent per-stage ms; `lift_stamps`
     # is a rolling window of lift timestamps used to compute the actual lift fps.
@@ -682,17 +684,36 @@ def run(argv=None) -> None:
                 )
 
             canvas = np.hstack([cam_panel, two_d_panel, three_d_panel])
+
+            if screenshot_deadline > 0:
+                remaining = screenshot_deadline - time.time()
+                if remaining <= 0:
+                    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(screenshot_path, frame_bgr)
+                    print(f"[test_2D_3D] Saved screenshot: {screenshot_path}")
+                    screenshot_deadline = 0
+                    screenshot_path = ""
+                else:
+                    countdown_text = f"Screenshot in {int(remaining) + 1}..."
+                    _draw_text(
+                        canvas,
+                        countdown_text,
+                        (canvas.shape[1] // 2 - 120, 60),
+                        color=(90, 220, 220),
+                        scale=1.3,
+                        thick=3,
+                    )
+
             cv2.imshow(window_name, canvas)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            elif key == ord("s"):
+            elif key == ord("s") and screenshot_deadline <= 0:
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                SAVE_DIR.mkdir(parents=True, exist_ok=True)
-                path = str(SAVE_DIR / f"frame_{ts}.png")
-                cv2.imwrite(path, frame_bgr)
-                print(f"[test_2D_3D] Saved screenshot: {path}")
+                screenshot_path = str(SAVE_DIR / f"frame_{ts}.png")
+                screenshot_deadline = time.time() + 3.0
+                print(f"[test_2D_3D] Pressed s — will save in 3s")
 
             # Cap UI loop at 30 fps (matches a typical webcam's native rate). With
             # inference throttled to 15 Hz separately, the camera panel still updates
