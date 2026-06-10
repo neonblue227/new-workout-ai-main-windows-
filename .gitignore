@@ -29,3 +29,8 @@ notebooks/data/
 
 # Harness scratch (subagent worktrees, etc.)
 .claude/
+
+# pictures
+bad/
+good/
+meh/
